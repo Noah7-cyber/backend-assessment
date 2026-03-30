@@ -1,5 +1,16 @@
 const pool = require("../db/postgres");
 
+function mapIdempotencyRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    orderId: Number(row.orderId),
+  };
+}
+
 async function createPayment({ orderId, amount, providerTxnId, status = "SUCCESS" }) {
   const query = `
     INSERT INTO payments (order_id, amount, provider_txn_id, status)
@@ -38,7 +49,7 @@ async function createIdempotencyKeyIfNotExists({ idempotencyKey, orderId }) {
     RETURNING idempotency_key AS "idempotencyKey", order_id AS "orderId", status, response
   `;
   const { rows } = await pool.query(query, [idempotencyKey, orderId]);
-  return rows[0] || null;
+  return mapIdempotencyRow(rows[0]);
 }
 
 async function getIdempotencyKey(idempotencyKey) {
@@ -48,7 +59,7 @@ async function getIdempotencyKey(idempotencyKey) {
     WHERE idempotency_key = $1
   `;
   const { rows } = await pool.query(query, [idempotencyKey]);
-  return rows[0] || null;
+  return mapIdempotencyRow(rows[0]);
 }
 
 async function markIdempotencyCompleted({ idempotencyKey, response }) {

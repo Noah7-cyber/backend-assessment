@@ -16,7 +16,7 @@ async function createOrder({ customerId, amount }) {
 }
 
 async function handleExistingIdempotency({ existing, orderId }) {
-  if (existing.orderId !== orderId) {
+  if (Number(existing.orderId) !== Number(orderId)) {
     const error = new Error("Idempotency key is already used for a different order");
     error.status = 409;
     throw error;
