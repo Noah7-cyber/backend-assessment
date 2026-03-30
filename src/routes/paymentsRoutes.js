@@ -5,8 +5,15 @@ const router = express.Router();
 
 router.post("/charge", async (req, res, next) => {
   try {
+    const orderId = Number(req.body.orderId);
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      const error = new Error("A valid numeric orderId is required");
+      error.status = 400;
+      throw error;
+    }
+
     const result = await ordersService.chargeOrder({
-      orderId: Number(req.body.orderId),
+      orderId,
       idempotencyKey: req.headers["idempotency-key"],
     });
     res.json(result);

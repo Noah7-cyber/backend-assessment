@@ -20,12 +20,45 @@ async function getOrderById(orderId) {
   return rows[0] || null;
 }
 
-async function markOrderAsPaid(orderId) {
+async function claimOrderForProcessing(orderId) {
+  const query = `
+    UPDATE orders
+    SET status = 'PROCESSING', updated_at = NOW()
+    WHERE id = $1 AND status = 'PENDING'
+    RETURNING id, customer_id AS "customerId", amount, status, created_at AS "createdAt", updated_at AS "updatedAt"
+  `;
+  const { rows } = await pool.query(query, [orderId]);
+  return rows[0] || null;
+}
+
+async function markOrderAsPaidIfProcessing(orderId) {
   const query = `
     UPDATE orders
     SET status = 'PAID', updated_at = NOW()
-    WHERE id = $1
+    WHERE id = $1 AND status = 'PROCESSING'
     RETURNING id, customer_id AS "customerId", amount, status, created_at AS "createdAt", updated_at AS "updatedAt"
+  `;
+  const { rows } = await pool.query(query, [orderId]);
+  return rows[0] || null;
+}
+
+async function markOrderAsPaidIfNotPaid(orderId) {
+  const query = `
+    UPDATE orders
+    SET status = 'PAID', updated_at = NOW()
+    WHERE id = $1 AND status <> 'PAID'
+    RETURNING id, customer_id AS "customerId", amount, status, created_at AS "createdAt", updated_at AS "updatedAt"
+  `;
+  const { rows } = await pool.query(query, [orderId]);
+  return rows[0] || null;
+}
+
+async function resetOrderToPendingIfProcessing(orderId) {
+  const query = `
+    UPDATE orders
+    SET status = 'PENDING', updated_at = NOW()
+    WHERE id = $1 AND status = 'PROCESSING'
+    RETURNING id
   `;
   const { rows } = await pool.query(query, [orderId]);
   return rows[0] || null;
@@ -62,6 +95,9 @@ async function getOrderWithPayments(orderId) {
 module.exports = {
   createOrder,
   getOrderById,
-  markOrderAsPaid,
+  claimOrderForProcessing,
+  markOrderAsPaidIfProcessing,
+  markOrderAsPaidIfNotPaid,
+  resetOrderToPendingIfProcessing,
   getOrderWithPayments,
 };

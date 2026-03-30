@@ -1,7 +1,6 @@
 const ordersRepository = require("../repositories/ordersRepository");
 const paymentsRepository = require("../repositories/paymentsRepository");
 const paymentGateway = require("./paymentGateway");
-const redis = require("../db/redis");
 
 async function createOrder({ customerId, amount }) {
   if (!customerId || !amount || Number(amount) <= 0) {
@@ -16,73 +15,126 @@ async function createOrder({ customerId, amount }) {
   });
 }
 
-// Intentionally buggy:
-// - no transaction
-// - stale order check with race window
-// - idempotency key read/write is not atomic
-async function chargeOrder({ orderId, idempotencyKey }) {
-  const order = await ordersRepository.getOrderById(orderId);
-  if (!order) {
+async function handleExistingIdempotency({ existing, orderId }) {
+  if (Number(existing.orderId) !== Number(orderId)) {
+    const error = new Error("Idempotency key is already used for a different order");
+    error.status = 409;
+    throw error;
+  }
+
+  if (existing.status === "COMPLETED" && existing.response) {
+    return existing.response;
+  }
+
+  const error = new Error("A request with this idempotency key is already in progress or failed");
+  error.status = 409;
+  throw error;
+}
+
+async function claimOrder(orderId) {
+  const order = await ordersRepository.claimOrderForProcessing(orderId);
+  if (order) {
+    return order;
+  }
+
+  const current = await ordersRepository.getOrderById(orderId);
+  if (!current) {
     const error = new Error("Order not found");
     error.status = 404;
     throw error;
   }
 
-  if (order.status !== "PENDING") {
-    const error = new Error("Only pending orders can be charged");
-    error.status = 409;
+  const error = new Error("Only pending orders can be charged");
+  error.status = 409;
+  throw error;
+}
+
+async function chargeOrder({ orderId, idempotencyKey }) {
+  let idempotencyOwned = false;
+  if (idempotencyKey) {
+    const created = await paymentsRepository.createIdempotencyKeyIfNotExists({
+      idempotencyKey,
+      orderId,
+    });
+
+    if (!created) {
+      const existing = await paymentsRepository.getIdempotencyKey(idempotencyKey);
+      return handleExistingIdempotency({ existing, orderId });
+    }
+
+    idempotencyOwned = true;
+  }
+
+  const order = await claimOrder(orderId);
+
+  try {
+    const gatewayResponse = await paymentGateway.charge({
+      orderId: order.id,
+      amount: order.amount,
+    });
+
+    const payment = await paymentsRepository.createPayment({
+      orderId: order.id,
+      amount: gatewayResponse.chargedAmount,
+      providerTxnId: gatewayResponse.providerTxnId,
+      status: "SUCCESS",
+    });
+
+    const updatedOrder = await ordersRepository.markOrderAsPaidIfProcessing(order.id);
+    if (!updatedOrder) {
+      throw new Error("Order status changed unexpectedly during charge completion");
+    }
+
+    const result = {
+      order: updatedOrder,
+      payment,
+    };
+
+    if (idempotencyKey && idempotencyOwned) {
+      await paymentsRepository.markIdempotencyCompleted({
+        idempotencyKey,
+        response: result,
+      });
+    }
+
+    return result;
+  } catch (error) {
+    await ordersRepository.resetOrderToPendingIfProcessing(orderId);
+
+    if (idempotencyKey && idempotencyOwned) {
+      await paymentsRepository.markIdempotencyFailed({
+        idempotencyKey,
+        errorMessage: error.message,
+      });
+    }
+
+    throw error;
+  }
+}
+
+async function processPaymentWebhook({ providerEventId, orderId, eventType, payload }) {
+  if (!providerEventId || !orderId || !eventType) {
+    const error = new Error("providerEventId, orderId and eventType are required");
+    error.status = 400;
     throw error;
   }
 
-  if (idempotencyKey) {
-    const existing = await redis.get(`idem:${idempotencyKey}`);
-    if (existing) {
-      return JSON.parse(existing);
-    }
-  }
-
-  const gatewayResponse = await paymentGateway.charge({
-    orderId: order.id,
-    amount: order.amount,
-  });
-
-  const payment = await paymentsRepository.createPayment({
-    orderId: order.id,
-    amount: gatewayResponse.chargedAmount,
-    providerTxnId: gatewayResponse.providerTxnId,
-    status: "SUCCESS",
-  });
-
-  const updatedOrder = await ordersRepository.markOrderAsPaid(order.id);
-
-  const result = {
-    order: updatedOrder,
-    payment,
-  };
-
-  if (idempotencyKey) {
-    await redis.set(`idem:${idempotencyKey}`, JSON.stringify(result), "EX", 3600);
-  }
-
-  return result;
-}
-
-// Intentionally buggy:
-// - webhook dedupe is not enforced
-// - status update is not validated by event type
-async function processPaymentWebhook({ providerEventId, orderId, eventType, payload }) {
-  await paymentsRepository.createWebhookEvent({
+  const result = await paymentsRepository.createWebhookEventIfNotExists({
     providerEventId,
     orderId,
     eventType,
     payload,
   });
 
-  if (eventType === "payment_succeeded") {
-    await ordersRepository.markOrderAsPaid(orderId);
+  if (!result.inserted) {
+    return { accepted: true, duplicate: true };
   }
 
-  return { accepted: true };
+  if (eventType === "payment_succeeded") {
+    await ordersRepository.markOrderAsPaidIfNotPaid(orderId);
+  }
+
+  return { accepted: true, duplicate: false };
 }
 
 async function getOrderById(orderId) {

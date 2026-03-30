@@ -1,5 +1,16 @@
 const pool = require("../db/postgres");
 
+function mapIdempotencyRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    ...row,
+    orderId: Number(row.orderId),
+  };
+}
+
 async function createPayment({ orderId, amount, providerTxnId, status = "SUCCESS" }) {
   const query = `
     INSERT INTO payments (order_id, amount, provider_txn_id, status)
@@ -10,10 +21,11 @@ async function createPayment({ orderId, amount, providerTxnId, status = "SUCCESS
   return rows[0];
 }
 
-async function createWebhookEvent({ providerEventId, orderId, eventType, payload }) {
+async function createWebhookEventIfNotExists({ providerEventId, orderId, eventType, payload }) {
   const query = `
     INSERT INTO payment_events (provider_event_id, order_id, event_type, payload)
     VALUES ($1, $2, $3, $4)
+    ON CONFLICT (provider_event_id) DO NOTHING
     RETURNING id, provider_event_id AS "providerEventId", order_id AS "orderId", event_type AS "eventType", created_at AS "createdAt"
   `;
   const { rows } = await pool.query(query, [
@@ -22,10 +34,57 @@ async function createWebhookEvent({ providerEventId, orderId, eventType, payload
     eventType,
     JSON.stringify(payload || {}),
   ]);
-  return rows[0];
+
+  return {
+    inserted: Boolean(rows[0]),
+    event: rows[0] || null,
+  };
+}
+
+async function createIdempotencyKeyIfNotExists({ idempotencyKey, orderId }) {
+  const query = `
+    INSERT INTO idempotency_keys (idempotency_key, order_id, status)
+    VALUES ($1, $2, 'IN_PROGRESS')
+    ON CONFLICT (idempotency_key) DO NOTHING
+    RETURNING idempotency_key AS "idempotencyKey", order_id AS "orderId", status, response
+  `;
+  const { rows } = await pool.query(query, [idempotencyKey, orderId]);
+  return mapIdempotencyRow(rows[0]);
+}
+
+async function getIdempotencyKey(idempotencyKey) {
+  const query = `
+    SELECT idempotency_key AS "idempotencyKey", order_id AS "orderId", status, response
+    FROM idempotency_keys
+    WHERE idempotency_key = $1
+  `;
+  const { rows } = await pool.query(query, [idempotencyKey]);
+  return mapIdempotencyRow(rows[0]);
+}
+
+async function markIdempotencyCompleted({ idempotencyKey, response }) {
+  const query = `
+    UPDATE idempotency_keys
+    SET status = 'COMPLETED', response = $2::jsonb, error_message = NULL, updated_at = NOW()
+    WHERE idempotency_key = $1
+  `;
+  await pool.query(query, [idempotencyKey, JSON.stringify(response)]);
+}
+
+async function markIdempotencyFailed({ idempotencyKey, errorMessage }) {
+  const query = `
+    UPDATE idempotency_keys
+    SET status = 'FAILED', error_message = $2, updated_at = NOW()
+    WHERE idempotency_key = $1
+  `;
+  await pool.query(query, [idempotencyKey, errorMessage]);
 }
 
 module.exports = {
   createPayment,
-  createWebhookEvent,
+  createWebhookEventIfNotExists,
+  createIdempotencyKeyIfNotExists,
+  getIdempotencyKey,
+  markIdempotencyCompleted,
+  markIdempotencyFailed,
 };
