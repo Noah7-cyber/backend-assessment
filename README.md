@@ -1,131 +1,205 @@
-# Backend Assessment - Senior (Node.js/Express)
+# Backend Assessment – Senior (Node.js/Express)
 
-This repository is a pre-interview backend assessment starter.
+This repository contains my solution to the backend assessment.
 
-The API is partially working, but contains hidden logical bugs.
-There are no syntax traps. Focus is on correctness under concurrency and failure.
+The original starter API was partially functional, but had hidden logical/data-integrity bugs under concurrency and retries.  
+The focus of my solution is correctness under real-world failure modes — not just passing happy-path requests.
 
-## Scenario
+---
+
+## Background (Original Assessment Context)
+
+This project models a simple payment lifecycle:
 
 - Orders are created
-- Payments are processed
-- A payment webhook updates order status
-- Some cases can lead to:
-  - double-charging
-  - missing consistency across order/payment records
-  - race conditions
+- Payments are charged
+- Payment webhooks update order state
 
-## Tech
+The initial implementation could lead to:
+
+- double-charging
+- inconsistent order/payment records
+- race conditions during retries
+
+Evaluation focus areas were:
+
+- correctness and data integrity
+- concurrency safety
+- retry/idempotency behavior
+- test quality and production judgment
+
+---
+
+## 🧠 Debugging Note (Most Important Real Bug Found)
+
+A subtle idempotency bug appeared during manual verification:
+
+1. Charge order `5` with key `fresh-key-5` → success  
+2. Retry same request (same key + same order)  
+3. API incorrectly returned: **“Idempotency key is already used for a different order”**
+
+### Root cause
+
+- PostgreSQL `BIGINT` often comes back as a string (e.g. `"5"`)
+- Request payload `orderId` is numeric (e.g. `5`)
+- Strict comparison treated them as different (`"5" !== 5`)
+
+### Fix
+
+- Normalize IDs before comparison in idempotency checks
+- Normalize `orderId` mapping in repository layer so service logic gets consistent numeric IDs
+
+This issue did not reliably surface in mocked tests; it appeared when exercising real DB-backed behavior — exactly the kind of thing financial flows need to guard against.
+
+---
+
+## ⚙️ Tech Stack
 
 - Node.js + Express
-- PostgreSQL required
-- Redis included and used for idempotency cache
+- PostgreSQL (**primary source of truth**)
+- Redis (present in the project; correctness is no longer dependent on Redis idempotency behavior)
 
-Candidates may replace parts with their preferred approach if justified.
+---
 
-## Run
+## ✅ What Was Found
 
-1. Install dependencies:
+The starter code had several critical issues:
+
+- non-atomic charge flow allowed concurrent double processing
+- Redis idempotency pattern (`GET` then `SET`) had race windows and no durability guarantees
+- webhook replay/deduplication was not durably enforced
+- order/payment state could diverge across failure windows
+- key invariants were not fully protected at the DB level
+
+---
+
+## 🧩 Why It Happened
+
+Primary causes:
+
+- critical invariants enforced in app code instead of PostgreSQL constraints
+- read-then-write state transitions without guarded/atomic progression
+- retry/replay handling without conflict-safe persistence patterns
+
+---
+
+## 🛠️ What I Changed
+
+### 1) Guarded order state transitions
+
+Implemented controlled state flow:
+
+`PENDING -> PROCESSING -> PAID`
+
+This prevents multiple charge paths from progressing simultaneously for the same order.
+
+---
+
+### 2) Durable idempotency in PostgreSQL
+
+Added `idempotency_keys` table and idempotency lifecycle handling in Postgres, so replay correctness is durable and not dependent on Redis timing.
+
+---
+
+### 3) Database-level invariants
+
+Added/updated DB constraints:
+
+- unique `payments.provider_txn_id`
+- one successful payment per order
+- unique `payment_events.provider_event_id`
+- order status constraint includes `PROCESSING`
+
+---
+
+### 4) Webhook replay safety
+
+Webhook ingestion uses conflict-safe insert (`ON CONFLICT DO NOTHING`) so duplicate deliveries become safe no-op behavior.
+
+---
+
+### 5) Regression tests
+
+Added tests for:
+
+- concurrent charge contention behavior
+- idempotency replay behavior
+- webhook duplicate handling
+- failure rollback/recovery behavior
+- integration flow validating same-key same-order idempotent retry against Postgres-backed path
+
+> Integration test is designed to skip when PostgreSQL is unreachable in the execution environment.
+
+---
+
+## ✅ Why This Is Safer
+
+- correctness-critical invariants are enforced by PostgreSQL
+- payment execution requires an atomic order claim
+- duplicate/replayed operations become deterministic no-op behavior
+- system behavior is stable under retries and concurrent attempts
+
+---
+
+## ⚠️ Trade-offs / Remaining Risks
+
+- Provider network call still occurs outside DB transaction boundaries (intentional, to avoid long-lived DB locks)
+- If provider succeeds but local persistence fails immediately afterward, reconciliation is still required
+- `FAILED` idempotency keys currently require using a new key for retry
+
+---
+
+## 🚀 Running the Project
+
+### 1) Install dependencies
 
 ```bash
 npm install
-```
-
-2. Copy env:
-
-```bash
+2) Copy env file
 cp .env.example .env
-```
-
-3. Start infra:
-
-```bash
+3) Start infrastructure
 docker compose up -d
-```
-
-4. Run DB migration and seed:
-
-```bash
+4) Run migration + seed
 npm run db:migrate
 npm run db:seed
-```
-
-5. Start API:
-
-```bash
+5) Start API
 npm run dev
-```
+Health check:
 
-Health endpoint:
-
-```bash
 GET /health
-```
+📡 API Endpoints
+Create Order
+POST /orders
 
-## Endpoints
+{
+  "customerId": "customer_001",
+  "amount": 120.5
+}
+Get Order
+GET /orders/:id
 
-- `POST /orders`
-  - body: `{ "customerId": "customer_001", "amount": 120.5 }`
-- `GET /orders/:id`
-- `POST /payments/charge`
-  - body: `{ "orderId": 1 }`
-  - optional header: `Idempotency-Key: abc-123`
-- `POST /payments/webhook`
-  - body example:
-    `{ "providerEventId": "evt-1", "orderId": 1, "eventType": "payment_succeeded", "payload": {} }`
+Charge Payment
+POST /payments/charge
 
-## Candidate Task (8h max)
+{
+  "orderId": 1
+}
+Optional header:
 
-1. Identify as many critical logical/data-integrity issues as possible.
-2. Fix the issues with production-appropriate changes.
-3. Add tests proving fixes, especially for concurrency/idempotency paths.
-4. Write a short explanation:
-   - what issues were found
-   - why they happen
-   - why your fix is safe
-   - what trade-offs remain
+Idempotency-Key: abc-123
+Payment Webhook
+POST /payments/webhook
 
-## Evaluation Focus
+{
+  "providerEventId": "evt-1",
+  "orderId": 1,
+  "eventType": "payment_succeeded",
+  "payload": {}
+}
+🧪 Test Commands
+Unit tests:
 
-- Correctness and data integrity
-- Concurrency safety
-- Retry/idempotency behavior
-- Quality of tests and reasoning
-- Practical production judgment
+npm test
+Integration test:
 
-## Correctness Fix Summary
-
-### 1) What was found
-
-- Charge flow allowed concurrent double-charging due to non-atomic read/check/write behavior.
-- Redis idempotency was a race-prone GET/SET pattern and not durable.
-- Webhooks were not deduplicated.
-- Order/payment updates could diverge under failure windows.
-- Database constraints were missing for key uniqueness guarantees.
-
-### 2) Why it happened
-
-- Critical invariants were enforced mainly in application logic and not by PostgreSQL constraints.
-- State transitions were unconditional and not guarded by current status.
-- Retry/replay paths lacked conflict-safe insert patterns.
-
-### 3) What was changed
-
-- Added guarded order transitions (`PENDING -> PROCESSING -> PAID`) in repository methods.
-- Added durable idempotency tracking in PostgreSQL (`idempotency_keys` table).
-- Added uniqueness constraints/indexes for `payments.provider_txn_id`, one successful payment per order, and `payment_events.provider_event_id`.
-- Updated webhook processing to use conflict-safe insert (`ON CONFLICT DO NOTHING`) and duplicate-safe behavior.
-- Added regression tests for concurrent charge behavior, idempotency behavior, webhook replay safety, and failure recovery paths.
-
-### 4) Why the fix is safe
-
-- PostgreSQL now enforces critical uniqueness invariants directly.
-- Charge execution requires an atomic claim of the order (`status = 'PENDING'`), preventing concurrent charge paths from both progressing.
-- Duplicate webhook deliveries become no-op side effects.
-- Idempotency is durable and no longer depends on Redis correctness.
-
-### 5) Trade-offs / remaining risks
-
-- The external provider charge call is still outside DB transaction boundaries (intentional to avoid long-running DB transactions over network I/O).
-- If provider succeeds but local persistence fails immediately afterward, manual reconciliation may still be needed without provider-side idempotency support.
-- Idempotency entries marked `FAILED` currently require a new key to retry safely.
+npm run test:integration
