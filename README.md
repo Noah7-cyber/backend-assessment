@@ -92,3 +92,40 @@ GET /health
 - Retry/idempotency behavior
 - Quality of tests and reasoning
 - Practical production judgment
+
+## Correctness Fix Summary
+
+### 1) What was found
+
+- Charge flow allowed concurrent double-charging due to non-atomic read/check/write behavior.
+- Redis idempotency was a race-prone GET/SET pattern and not durable.
+- Webhooks were not deduplicated.
+- Order/payment updates could diverge under failure windows.
+- Database constraints were missing for key uniqueness guarantees.
+
+### 2) Why it happened
+
+- Critical invariants were enforced mainly in application logic and not by PostgreSQL constraints.
+- State transitions were unconditional and not guarded by current status.
+- Retry/replay paths lacked conflict-safe insert patterns.
+
+### 3) What was changed
+
+- Added guarded order transitions (`PENDING -> PROCESSING -> PAID`) in repository methods.
+- Added durable idempotency tracking in PostgreSQL (`idempotency_keys` table).
+- Added uniqueness constraints/indexes for `payments.provider_txn_id`, one successful payment per order, and `payment_events.provider_event_id`.
+- Updated webhook processing to use conflict-safe insert (`ON CONFLICT DO NOTHING`) and duplicate-safe behavior.
+- Added regression tests for concurrent charge behavior, idempotency behavior, webhook replay safety, and failure recovery paths.
+
+### 4) Why the fix is safe
+
+- PostgreSQL now enforces critical uniqueness invariants directly.
+- Charge execution requires an atomic claim of the order (`status = 'PENDING'`), preventing concurrent charge paths from both progressing.
+- Duplicate webhook deliveries become no-op side effects.
+- Idempotency is durable and no longer depends on Redis correctness.
+
+### 5) Trade-offs / remaining risks
+
+- The external provider charge call is still outside DB transaction boundaries (intentional to avoid long-running DB transactions over network I/O).
+- If provider succeeds but local persistence fails immediately afterward, manual reconciliation may still be needed without provider-side idempotency support.
+- Idempotency entries marked `FAILED` currently require a new key to retry safely.
